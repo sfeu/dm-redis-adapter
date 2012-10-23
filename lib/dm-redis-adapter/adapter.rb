@@ -20,8 +20,43 @@ module DataMapper
         resources.each do |resource|
           initialize_serial(resource, @redis.incr("#{storage_name}:#{redis_key_for(resource.model)}:serial"))
           @redis.sadd(key_set_for(resource.model), resource.key.join)
+          t = resource.model.properties.discriminator
+          add_to_discriminator_cache(resource) if resource.model.properties.discriminator
         end
         update_attributes(resources)
+      end
+
+      def to_discr_name(cl)
+        cl.to_s.downcase!.gsub('::','_')+":id:all"
+      end
+
+      ##
+      # Called upon resource creation for resources that contain a discriminator property.
+      # This method stores shortcuts: class->key to improve inheritance based queries.
+      # like class.all or class.first \wo key attribute
+      def add_to_discriminator_cache(resource)
+
+        # for the base class a lookup cache already exists
+        return if resource.class == resource.model.properties.discriminator.model.base_model
+
+        i = resource.class
+
+        while i != resource.model.properties.discriminator.model.base_model do
+          @redis.sadd(to_discr_name(i),resource.key.join)
+          i = i.superclass
+        end
+      end
+
+      def remove_from_discriminator_cache(resource)
+
+        return if resource.class == resource.model.properties.discriminator.model.base_model
+
+        i = resource.class
+
+        while i != resource.model.properties.discriminator.model.base_model do
+          @redis.srem(to_discr_name(i),resource.key.join)
+          i = i.superclass
+        end
       end
 
       ##
@@ -97,6 +132,7 @@ module DataMapper
           record.model.properties.select {|p| p.index}.each do |p|
             @redis.srem("#{collection.query.model.to_s.downcase}:#{p.name}:#{encode(record[p.name])}", record[redis_key_for(collection.query.model)])
           end
+          remove_from_discriminator_cache(record) if record.model.properties.discriminator
         end
       end
 
@@ -187,7 +223,7 @@ module DataMapper
                 keys = keys + perform_query(query, op)
               end
             else
-              keys = perform_query(query, operand)
+              keys = perform_query(query, operand,keys)
             end
           end
         end
@@ -201,10 +237,10 @@ module DataMapper
         elsif operand.subject.is_a?(DataMapper::Associations::ManyToOne::Relationship)
           subject = operand.subject.child_key.first
           value = if operand.is_a?(DataMapper::Query::Conditions::InclusionComparison)
-            operand.value.map{|v| v[operand.subject.parent_key.first.name]}
-          else
-            operand.value[operand.subject.parent_key.first.name]
-          end
+                    operand.value.map{|v| v[operand.subject.parent_key.first.name]}
+                  else
+                    operand.value[operand.subject.parent_key.first.name]
+                  end
         else
           subject = operand.subject
           value = operand.value
@@ -226,7 +262,7 @@ module DataMapper
       # @param [DataMapper::Operation] the operation for the query
       #
       # @api private
-      def perform_query(query, operand)
+      def perform_query(query, operand, matched_keys = nil)
         storage_name = query.model.storage_name
         matched_records = []
         subject, value = find_subject_and_value(query, operand)
@@ -255,22 +291,34 @@ module DataMapper
                   matched_records << {redis_key_for(query.model) => k, "#{subject.name}" => val}
                 end
               end
+            elsif subject.is_a? DataMapper::Property::Discriminator
+              @redis.smembers(to_discr_name(query.model)).each do |key|
+                matched_records << {redis_key_for(query.model) => key }
+              end
             else
               search_all_resources(query, operand, subject, matched_records)
             end
           when DataMapper::Query::Conditions::EqualToComparison
             if query.model.key.include?(subject) and @redis.sismember(key_set_for(query.model), value)
-                matched_records << {redis_key_for(query.model) => value}
+              matched_records << {redis_key_for(query.model) => value}
 
             elsif subject.respond_to?(:index) && subject.index
               find_indexed_matches(subject, value).each do |k|
                 matched_records << {redis_key_for(query.model) => k, "#{subject.name}" => value}
               end
             else
-              search_all_resources(query, operand, subject, matched_records)
+              if matched_keys.nil?
+                search_all_resources(query, operand, subject,matched_records)
+              else
+                matched_records = search_partial_resources(query, operand, subject,matched_keys)
+              end
             end
           else # worst case here, loop through all members, typecast and match
-            search_all_resources(query, operand, subject, matched_records)
+            if matched_keys.nil?
+              search_all_resources(query, operand, subject,matched_records)
+            else
+              matched_records = search_partial_resources(query, operand, subject,matched_keys)
+            end
         end
         matched_records
       end
@@ -285,6 +333,16 @@ module DataMapper
             matched_records << {redis_key_for(query.model) => key}
           end
         end
+      end
+
+      def search_partial_resources(query, operand, subject,  matched_keys)
+        matched_records = []
+        matched_keys.each do |key|
+          if operand.matches?(subject.typecast(@redis.hget("#{subject.model.storage_name}:#{key.values[0]}", subject.name)))
+            matched_records << key
+          end
+        end
+        matched_records
       end
 
       ##
